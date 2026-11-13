@@ -2207,6 +2207,7 @@ async function l2TestKey(){
     if(!r.ok) throw new Error(d && d.error && d.error.message ? d.error.message : ('Erreur HTTP '+r.status));
     stop();
     names = (d.models||[]).filter(x=>(x.supportedGenerationMethods||[]).includes('generateContent')).map(x=>x.name.replace(/^models\//,''));
+    try{ localStorage.setItem('medflash_gemini_models', JSON.stringify(names)); }catch(e){}
     let model = l2Model(), note = '';
     if(names.length && !names.includes(model)){
       const best = l2PickModel(names);
@@ -2215,10 +2216,10 @@ async function l2TestKey(){
     }
     const base = '✅ <b>Clé reconnue !</b> '+names.length+' modèles accessibles.'+note;
     m.className = 'l2-status show ok';
-    stop = l2Timer(t=>{ m.innerHTML = base+'<br><span class="l2-spin"></span>Test du modèle « '+esc(model)+' »… ⏱ '+t; });
+    stop = l2Timer(t=>{ m.innerHTML = base+'<br><span class="l2-spin"></span>Test du modèle « '+esc(l2Using||model)+' »… ⏱ '+t; });
     try{
-      await l2Claude([{ text:'Réponds uniquement par un tableau JSON contenant le mot "ok" : ["ok"]' }], 45000);
-      stop(); m.innerHTML = base+'<br>✅ Le modèle « '+esc(model)+' » répond : tu peux générer tes flashcards.';
+      await l2Run([{ text:'Réponds uniquement par un tableau JSON contenant le mot "ok" : ["ok"]' }], 45000);
+      stop(); m.innerHTML = base+(l2Fell ? '<br>⚠️ « '+esc(model)+' » est surchargé en ce moment (temporaire). ✅ Le modèle de secours « '+esc(l2Fell)+' » répond : la génération l\'utilisera automatiquement.' : '<br>✅ Le modèle « '+esc(model)+' » répond : tu peux générer tes flashcards.');
     }catch(e){
       stop();
       const flash = names.filter(n=>/flash/i.test(n) && /^gemini-\d/.test(n)).slice(0,6).join(', ');
@@ -2349,15 +2350,51 @@ function l2Timer(render){
   tick(); const id = setInterval(tick, 1000);
   return ()=>clearInterval(id);
 }
-function l2Cancel(){ if(l2Ctl) l2Ctl.abort(); }
+function l2Cancel(){ l2Stop = true; if(l2Ctl) l2Ctl.abort(); }
+let l2Using = '', l2Fell = '', l2Stop = false;
+function l2Fallbacks(main){
+  let names = [];
+  try{ names = JSON.parse(localStorage.getItem('medflash_gemini_models')||'[]'); }catch(e){}
+  if(!names.length) names = ['gemini-3-flash-preview','gemini-2.5-flash','gemini-2.5-flash-lite'];
+  const c = names.filter(n=>n!==main && /^gemini-\d+(\.\d+)?-flash(-lite)?(-preview)?$/.test(n));
+  const score = n => (/lite/.test(n)?1000:0) - parseFloat(n.split('-')[1])*10;
+  c.sort((a,b)=>score(a)-score(b));
+  return c.slice(0,4);
+}
+async function l2Run(parts, timeoutMs){
+  const main = l2Model();
+  const order = [main, ...l2Fallbacks(main)];
+  l2Fell = ''; l2Stop = false;
+  let lastErr = null;
+  for(let i=0;i<order.length;i++){
+    const m = order[i];
+    l2Using = m;
+    for(let attempt=0; attempt<2; attempt++){
+      try{
+        const out = await l2Claude(parts, timeoutMs, m);
+        if(m !== main) l2Fell = m;
+        return out;
+      }catch(e){
+        lastErr = e;
+        const msg = String(e && e.message || e);
+        if(/annulée/i.test(msg) || l2Stop) throw e;
+        const transient = /high demand|overload|UNAVAILABLE|503|429|RESOURCE_EXHAUSTED|quota|Délai dépassé|not found|no longer available|404|currently experiencing/i.test(msg);
+        if(!transient) throw e;
+        if(attempt===0 && /high demand|overload|UNAVAILABLE|503|currently experiencing/i.test(msg)){ await new Promise(r=>setTimeout(r,2500)); continue; }
+        break;
+      }
+    }
+  }
+  throw lastErr || new Error('Aucun modèle disponible');
+}
 function l2PickModel(names){
   const c = names.filter(n=>/^gemini-\d+(\.\d+)?-flash$/.test(n));
   c.sort((x,y)=>parseFloat(y.split('-')[1])-parseFloat(x.split('-')[1]));
   return c[0] || names.filter(n=>/^gemini-\d+(\.\d+)?-flash/.test(n))[0] || null;
 }
-async function l2Claude(parts, timeoutMs){
+async function l2Claude(parts, timeoutMs, modelOverride){
   const key = (localStorage.getItem('medflash_gemini_key')||'').trim();
-  const model = l2Model();
+  const model = modelOverride || l2Model();
   const ctl = new AbortController(); l2Ctl = ctl;
   let timedOut = false;
   const lim = timeoutMs || 150000;
@@ -2418,7 +2455,7 @@ async function l2Generate(kind){
   l2Busy = true;
   const btns = [document.getElementById('l2-gen-cards'), document.getElementById('l2-gen-qcm')];
   btns.forEach(b=>b.disabled = true);
-  const stopT = l2Timer(t=>l2Status('<span class="l2-spin"></span>Génération en cours… ⏱ <b>'+t+'</b> <small>(en général 20 s à 2 min)</small> <button class="l2-btn ghost" style="padding:4px 10px;margin-left:8px" onclick="l2Cancel()">✖ Annuler</button>', 'info'));
+  const stopT = l2Timer(t=>l2Status('<span class="l2-spin"></span>Génération en cours… ⏱ <b>'+t+'</b> <small>(en général 20 s à 2 min · modèle : '+esc(l2Using||l2Model())+')</small> <button class="l2-btn ghost" style="padding:4px 10px;margin-left:8px" onclick="l2Cancel()">✖ Annuler</button>', 'info'));
   try{
     const blocks = [];
     for(const f of l2Files){
@@ -2429,24 +2466,24 @@ async function l2Generate(kind){
     if(kind === 'cards'){
       const n = document.getElementById('l2-ncards-sel').value;
       blocks.push({ text:l2PromptCards(n) });
-      const arr = l2ParseJSON(await l2Claude(blocks));
+      const arr = l2ParseJSON(await l2Run(blocks, 120000));
       const have = new Set(l2Cards(s).map(c=>c.question));
       const fresh = arr.filter(c=>c && c.question && c.answer).map(c=>({
         question: esc(c.question), answer: esc(c.answer), expl: esc(c.expl||''), tag: '🤖 '+(c.tag||'Notes')
       })).filter(c=>!have.has(c.question));
       store.cards.push(...fresh);
       l2Save('medflash_l2ai_'+s.id, store);
-      l2Status('✅ '+fresh.length+' flashcards ajoutées à « '+esc(s.name)+' ».', 'ok');
+      l2Status('✅ '+fresh.length+' flashcards ajoutées à « '+esc(s.name)+' ».'+(l2Fell?' <small>(modèle utilisé : '+esc(l2Fell)+', le principal étant surchargé)</small>':''), 'ok');
     } else {
       const n = document.getElementById('l2-nqcm-sel').value;
       const level = document.getElementById('l2-level-sel').value;
       blocks.push({ text:l2PromptQcm(n, level) });
-      const arr = l2ParseJSON(await l2Claude(blocks));
+      const arr = l2ParseJSON(await l2Run(blocks, 120000));
       const have = new Set(l2Qcm(s).map(q=>q.q));
       const fresh = arr.map(o=>l2NormQcm(o, level==='mixte'?'moyen':level)).filter(q=>q && !have.has(q.q));
       store.qcm.push(...fresh);
       l2Save('medflash_l2ai_'+s.id, store);
-      l2Status('✅ '+fresh.length+' QCM ajoutés au Challenge de « '+esc(s.name)+' ».', 'ok');
+      l2Status('✅ '+fresh.length+' QCM ajoutés au Challenge de « '+esc(s.name)+' ».'+(l2Fell?' <small>(modèle utilisé : '+esc(l2Fell)+', le principal étant surchargé)</small>':''), 'ok');
     }
     l2RenderSubject();
   }catch(e){
