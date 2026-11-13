@@ -2178,6 +2178,8 @@ function l2Model(){
 }
 function l2Hint(msg){
   const m = String(msg||'');
+  if(/Délai dépassé/i.test(m)) return "Google ne répond pas. Clique sur <b>🔌 Tester ma clé</b> (réglages) pour voir les modèles disponibles ; essaie aussi moins de questions, un PDF plus léger, ou désactive VPN / bloqueur de pub.";
+  if(/annulée/i.test(m)) return "";
   if(/api key|API_KEY|invalid.*key|permission|PERMISSION_DENIED|403/i.test(m)) return "La clé est refusée. Il faut une clé créée sur <b>aistudio.google.com/apikey</b> (l'abonnement Gemini Pro / Google One ne donne PAS de clé API). Vérifie aussi qu'il n'y a pas d'espace en trop.";
   if(/quota|RESOURCE_EXHAUSTED|429|rate/i.test(m)) return "Quota atteint (ou 0 sur ce modèle). Attends 1 minute et réessaie, essaie un autre modèle Flash (ex : <b>gemini-3.6-flash</b>), ou active la facturation dans AI Studio.";
   if(/not found|404|not supported|no longer available|deprecated/i.test(m)) return "Ce modèle n'est plus disponible pour ta clé. Mets <b>gemini-3.8-flash</b> dans les réglages (ou le modèle indiqué dans le message de Google).";
@@ -2188,13 +2190,44 @@ function l2Hint(msg){
 async function l2TestKey(){
   l2SaveSettings(true);
   const m = document.getElementById('l2-settings-msg'), btn = document.getElementById('l2-test-btn');
-  if(!(localStorage.getItem('medflash_gemini_key')||'').trim()){ m.className='l2-status show err'; m.textContent='Colle d\'abord ta clé.'; return; }
-  btn.disabled = true; m.className = 'l2-status show info'; m.innerHTML = '<span class="l2-spin"></span>Test en cours…';
+  const key = (localStorage.getItem('medflash_gemini_key')||'').trim();
+  if(!key){ m.className='l2-status show err'; m.textContent='Colle d\'abord ta clé.'; return; }
+  btn.disabled = true;
+  let stop = l2Timer(t=>{ m.className='l2-status show info'; m.innerHTML='<span class="l2-spin"></span>Vérification de la clé… ⏱ '+t; });
+  let names = [];
   try{
-    const t = await l2Claude([{ text:'Réponds uniquement par un tableau JSON contenant le mot "ok" : ["ok"]' }]);
-    m.className = 'l2-status show ok'; m.textContent = '✅ La clé fonctionne ! (réponse : '+t.slice(0,40)+')';
+    const ctl = new AbortController(); const to = setTimeout(()=>ctl.abort(), 20000);
+    let r, d = null;
+    try{
+      r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers:{ 'x-goog-api-key': key }, signal: ctl.signal });
+      d = await r.json().catch(()=>null);
+    }catch(e){
+      throw new Error(e && e.name==='AbortError' ? 'Délai dépassé : Google n\'a pas répondu en 20 s.' : (e.message||e));
+    }finally{ clearTimeout(to); }
+    if(!r.ok) throw new Error(d && d.error && d.error.message ? d.error.message : ('Erreur HTTP '+r.status));
+    stop();
+    names = (d.models||[]).filter(x=>(x.supportedGenerationMethods||[]).includes('generateContent')).map(x=>x.name.replace(/^models\//,''));
+    let model = l2Model(), note = '';
+    if(names.length && !names.includes(model)){
+      const best = l2PickModel(names);
+      if(best){ note = ' Le modèle « '+esc(model)+' » n\'est pas disponible pour ta clé : remplacé par « '+esc(best)+' ».';
+        model = best; localStorage.setItem('medflash_gemini_model', best); document.getElementById('l2-model').value = best; }
+    }
+    const base = '✅ <b>Clé reconnue !</b> '+names.length+' modèles accessibles.'+note;
+    m.className = 'l2-status show ok';
+    stop = l2Timer(t=>{ m.innerHTML = base+'<br><span class="l2-spin"></span>Test du modèle « '+esc(model)+' »… ⏱ '+t; });
+    try{
+      await l2Claude([{ text:'Réponds uniquement par un tableau JSON contenant le mot "ok" : ["ok"]' }], 45000);
+      stop(); m.innerHTML = base+'<br>✅ Le modèle « '+esc(model)+' » répond : tu peux générer tes flashcards.';
+    }catch(e){
+      stop();
+      const flash = names.filter(n=>/flash/i.test(n) && /^gemini-\d/.test(n)).slice(0,6).join(', ');
+      m.className = 'l2-status show err';
+      m.innerHTML = '✅ Clé reconnue, mais ⚠️ le modèle « '+esc(model)+' » ne répond pas : '+esc(e.message||e)+'<br><small>'+l2Hint(e.message)+(flash?'<br>Modèles disponibles : '+esc(flash):'')+'</small>';
+    }
   }catch(e){
-    m.className = 'l2-status show err'; m.innerHTML = '❌ '+esc(e.message||e)+'<br><small>'+l2Hint(e.message)+'</small>';
+    stop(); m.className = 'l2-status show err';
+    m.innerHTML = '❌ Clé non reconnue : '+esc(e.message||e)+'<br><small>'+l2Hint(e.message)+'</small>';
   }finally{ btn.disabled = false; }
 }
 function l2AddSubject(){
@@ -2309,20 +2342,42 @@ Définition des niveaux : "facile" = définitions et rappels directs ; "moyen" =
 Règles : chaque QCM a EXACTEMENT 5 propositions A, B, C, D, E ; UNE OU PLUSIEURS propositions sont exactes (varie : parfois 1, souvent 2 à 4, jamais les 5) ; les fausses propositions sont plausibles ; pas de « toutes les réponses » ni « aucune ».
 Format : [{"q":"énoncé","opts":{"A":"…","B":"…","C":"…","D":"…","E":"…"},"correct":["A","C"],"expl":"explication courte justifiant chaque proposition","level":"facile|moyen|difficile","tag":"thème court"}]`;
 }
-async function l2Claude(parts){
+let l2Ctl = null;
+function l2Timer(render){
+  const t0 = Date.now();
+  const tick = ()=>{ const x = Math.floor((Date.now()-t0)/1000); render(String(Math.floor(x/60)).padStart(2,'0')+':'+String(x%60).padStart(2,'0')); };
+  tick(); const id = setInterval(tick, 1000);
+  return ()=>clearInterval(id);
+}
+function l2Cancel(){ if(l2Ctl) l2Ctl.abort(); }
+function l2PickModel(names){
+  const c = names.filter(n=>/^gemini-\d+(\.\d+)?-flash$/.test(n));
+  c.sort((x,y)=>parseFloat(y.split('-')[1])-parseFloat(x.split('-')[1]));
+  return c[0] || names.filter(n=>/^gemini-\d+(\.\d+)?-flash/.test(n))[0] || null;
+}
+async function l2Claude(parts, timeoutMs){
   const key = (localStorage.getItem('medflash_gemini_key')||'').trim();
   const model = l2Model();
-  const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent', {
-    method:'POST',
-    headers:{ 'content-type':'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify({
-      systemInstruction:{ parts:[{ text:L2_SYSTEM }] },
-      contents:[{ role:'user', parts }],
-      generationConfig:Object.assign({ maxOutputTokens:16384, responseMimeType:'application/json' }, /^gemini-3/i.test(model) ? { thinkingConfig:{ thinkingLevel:'low' } } : { temperature:0.4, thinkingConfig:{ thinkingBudget:0 } })
-    })
-  });
-  let data = null;
-  try{ data = await resp.json(); }catch(e){}
+  const ctl = new AbortController(); l2Ctl = ctl;
+  let timedOut = false;
+  const lim = timeoutMs || 150000;
+  const to = setTimeout(()=>{ timedOut = true; ctl.abort(); }, lim);
+  let resp, data = null;
+  try{
+    resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent', {
+      method:'POST', signal: ctl.signal,
+      headers:{ 'content-type':'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        systemInstruction:{ parts:[{ text:L2_SYSTEM }] },
+        contents:[{ role:'user', parts }],
+        generationConfig:Object.assign({ maxOutputTokens:16384, responseMimeType:'application/json' }, /^gemini-3/i.test(model) ? { thinkingConfig:{ thinkingLevel:'low' } } : { temperature:0.4, thinkingConfig:{ thinkingBudget:0 } })
+      })
+    });
+    try{ data = await resp.json(); }catch(e){ if(e && e.name==='AbortError') throw e; }
+  }catch(e){
+    if(e && e.name === 'AbortError') throw new Error(timedOut ? 'Délai dépassé : Google n\'a pas répondu en '+Math.round(lim/1000)+' s.' : 'Génération annulée.');
+    throw e;
+  }finally{ clearTimeout(to); if(l2Ctl===ctl) l2Ctl = null; }
   if(!resp.ok){
     throw new Error(data && data.error && data.error.message ? data.error.message : ('Erreur HTTP '+resp.status));
   }
@@ -2363,7 +2418,7 @@ async function l2Generate(kind){
   l2Busy = true;
   const btns = [document.getElementById('l2-gen-cards'), document.getElementById('l2-gen-qcm')];
   btns.forEach(b=>b.disabled = true);
-  l2Status('<span class="l2-spin"></span>Lecture de tes notes et génération en cours… (10 à 60 s)', 'info');
+  const stopT = l2Timer(t=>l2Status('<span class="l2-spin"></span>Génération en cours… ⏱ <b>'+t+'</b> <small>(en général 20 s à 2 min)</small> <button class="l2-btn ghost" style="padding:4px 10px;margin-left:8px" onclick="l2Cancel()">✖ Annuler</button>', 'info'));
   try{
     const blocks = [];
     for(const f of l2Files){
@@ -2397,7 +2452,7 @@ async function l2Generate(kind){
   }catch(e){
     l2Status('❌ '+esc(e.message || e)+' <br><small>'+l2Hint(e.message)+'</small>', 'err');
   }finally{
-    l2Busy = false; btns.forEach(b=>b.disabled = false);
+    stopT(); l2Busy = false; btns.forEach(b=>b.disabled = false);
   }
 }
 function l2GoSettings(){
